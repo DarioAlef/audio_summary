@@ -19,10 +19,10 @@ def verificar_gpu():
         print("⚠️  GPU não detectada. Usando CPU.")
         return False
 
-def transcrever_audio_segmentado(caminho_audio, modelo="base", usar_gpu=True, tamanho_segmento=1800):
+def transcrever_audio_segmentado(caminho_audio, modelo="base", usar_gpu=True, tamanho_segmento=600):
     """
     Transcreve áudio longo dividindo em segmentos para evitar repetições.
-    tamanho_segmento: duração em segundos (padrão: 30 minutos)
+    tamanho_segmento: duração em segundos (padrão: 10 minutos - reduzido para evitar repetições)
     """
     gpu_disponivel = verificar_gpu() and usar_gpu
     device = "cuda" if gpu_disponivel else "cpu"
@@ -57,35 +57,124 @@ def transcrever_audio_segmentado(caminho_audio, modelo="base", usar_gpu=True, ta
         
         print(f"\n🎯 Processando segmento {i+1}/{num_segmentos} ({inicio/whisper.audio.SAMPLE_RATE/60:.1f}-{fim/whisper.audio.SAMPLE_RATE/60:.1f} min)")
         
-        # Configurações anti-repetição para cada segmento
+        # Configurações anti-repetição MAIS AGRESSIVAS
         result = model.transcribe(
             segmento_audio,
             language="pt",
-            verbose=False,  # Reduz spam no console
+            verbose=False,
             fp16=gpu_disponivel,
-            temperature=0.2,
+            temperature=0.0,  # Mais determinístico
             beam_size=1,
             best_of=1,
             word_timestamps=False,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
+            no_speech_threshold=0.8,  # Mais restritivo para silêncios
+            logprob_threshold=-0.5,   # Mais restritivo para confiança
+            compression_ratio_threshold=2.0,  # Mais sensível a repetições
             condition_on_previous_text=False,
-            hallucination_silence_threshold=3.0
+            hallucination_silence_threshold=2.0,  # Mais sensível a alucinações
+            suppress_tokens=[-1],  # Suprime tokens problemáticos
+            initial_prompt="Esta é uma transcrição de uma reunião de trabalho em português brasileiro."
         )
         
-        # Adiciona uma quebra entre segmentos
-        if i > 0:
-            texto_completo += "\n\n"
-        texto_completo += result["text"]
+        texto_segmento = result["text"].strip()
         
-        print(f"✅ Segmento {i+1} concluído: {len(result['text'])} caracteres")
+        # FILTRO ADICIONAL: Remove repetições óbvias dentro do segmento
+        texto_segmento = remover_repeticoes_locais(texto_segmento)
+        
+        # Adiciona uma quebra entre segmentos
+        if i > 0 and texto_segmento:
+            texto_completo += "\n\n"
+        
+        if texto_segmento:  # Só adiciona se não estiver vazio
+            texto_completo += texto_segmento
+        
+        print(f"✅ Segmento {i+1} concluído: {len(texto_segmento)} caracteres")
         
         # Limpa cache da GPU entre segmentos
         if gpu_disponivel:
             torch.cuda.empty_cache()
     
+    # FILTRO FINAL: Remove repetições entre segmentos
+    texto_completo = remover_repeticoes_globais(texto_completo)
+    
     return texto_completo
+
+def remover_repeticoes_locais(texto):
+    """
+    Remove repetições óbvias dentro de um segmento de texto.
+    """
+    import re
+    
+    # Remove repetições de palavras consecutivas (mais de 3x)
+    palavras = texto.split()
+    resultado = []
+    contador = 1
+    palavra_anterior = ""
+    
+    for palavra in palavras:
+        if palavra.lower() == palavra_anterior.lower():
+            contador += 1
+            if contador <= 3:  # Permite até 3 repetições
+                resultado.append(palavra)
+        else:
+            resultado.append(palavra)
+            contador = 1
+            palavra_anterior = palavra
+    
+    return " ".join(resultado)
+
+def remover_repeticoes_globais(texto):
+    """
+    Remove repetições de frases/blocos maiores no texto completo.
+    """
+    import re
+    
+    linhas = texto.split('\n')
+    linhas_limpas = []
+    
+    for linha in linhas:
+        linha = linha.strip()
+        if not linha:
+            continue
+            
+        # Remove linhas que são muito similares às anteriores
+        if not eh_linha_repetitiva(linha, linhas_limpas):
+            linhas_limpas.append(linha)
+    
+    return '\n'.join(linhas_limpas)
+
+def eh_linha_repetitiva(linha_atual, linhas_anteriores, threshold=0.8):
+    """
+    Verifica se uma linha é muito similar às anteriores.
+    """
+    if len(linhas_anteriores) == 0:
+        return False
+    
+    # Verifica similaridade com as últimas 5 linhas
+    for linha_anterior in linhas_anteriores[-5:]:
+        similaridade = calcular_similaridade(linha_atual.lower(), linha_anterior.lower())
+        if similaridade > threshold:
+            return True
+    
+    return False
+
+def calcular_similaridade(str1, str2):
+    """
+    Calcula similaridade simples entre duas strings.
+    """
+    if not str1 or not str2:
+        return 0
+    
+    palavras1 = set(str1.split())
+    palavras2 = set(str2.split())
+    
+    if not palavras1 or not palavras2:
+        return 0
+    
+    intersecao = len(palavras1.intersection(palavras2))
+    uniao = len(palavras1.union(palavras2))
+    
+    return intersecao / uniao if uniao > 0 else 0
 
 def transcrever_audio_longo(caminho_audio, modelo="base", usar_gpu=True, usar_segmentacao=True):
     """
