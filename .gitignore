@@ -12,3 +12,7 @@ instance/
 .env
 .env.*
 .DS_Store
+
+
+texto/texto_gerado.md
+audios/*

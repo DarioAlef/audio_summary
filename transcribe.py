@@ -1,304 +1,139 @@
-import whisper
-import torch
 import os
-import warnings
+import time
+import io
+import ffmpeg
+from groq import Groq
+from dotenv import load_dotenv
 from pathlib import Path
-import math
 
-warnings.filterwarnings("ignore", message=".*Triton kernels.*")
+# Carrega variáveis de ambiente
+load_dotenv()
 
-def verificar_gpu():
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        cuda_version = torch.version.cuda
-        print(f"✅ GPU detectada: {gpu_name}")
-        print(f"🔥 VRAM disponível: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        print(f"⚡ CUDA version: {cuda_version}")
-        return True
-    else:
-        print("⚠️  GPU não detectada. Usando CPU.")
-        return False
+# Configuração
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+AUDIO_FOLDER = "audios"
+OUTPUT_FILE = "texto/texto_gerado.md"
+CHUNK_DURATION = 120  # 2 minutos em segundos
 
-def transcrever_audio_segmentado(caminho_audio, modelo="base", usar_gpu=True, tamanho_segmento=600):
+def get_audio_duration(file_path):
+    """Retorna a duração do áudio em segundos."""
+    try:
+        probe = ffmpeg.probe(file_path)
+        return float(probe['format']['duration'])
+    except ffmpeg.Error as e:
+        print(f"Erro ao ler duração do arquivo {file_path}: {e.stderr.decode() if e.stderr else e}")
+        raise
+
+def extract_audio_chunk(file_path, start_time, duration):
     """
-    Transcreve áudio longo dividindo em segmentos para evitar repetições.
-    tamanho_segmento: duração em segundos (padrão: 10 minutos - reduzido para evitar repetições)
+    Extrai um pedaço do áudio e retorna como um arquivo em memória (BytesIO/WAV).
     """
-    gpu_disponivel = verificar_gpu() and usar_gpu
-    device = "cuda" if gpu_disponivel else "cpu"
-    
-    print(f"Carregando modelo Whisper '{modelo}' no {device.upper()}...")
-    
-    if gpu_disponivel:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-    
-    model = whisper.load_model(modelo, device=device)
-    
-    print(f"🔄 Processando áudio em segmentos de {tamanho_segmento//60} minutos para evitar repetições...")
-    
-    # Carrega o áudio completo para obter informações
-    audio = whisper.load_audio(caminho_audio)
-    duracao_total = len(audio) / whisper.audio.SAMPLE_RATE
-    
-    print(f"📊 Duração total do áudio: {duracao_total/60:.1f} minutos")
-    
-    # Calcula número de segmentos
-    num_segmentos = math.ceil(duracao_total / tamanho_segmento)
-    print(f"🔢 Dividindo em {num_segmentos} segmentos")
-    
-    texto_completo = ""
-    
-    for i in range(num_segmentos):
-        inicio = i * tamanho_segmento * whisper.audio.SAMPLE_RATE
-        fim = min((i + 1) * tamanho_segmento * whisper.audio.SAMPLE_RATE, len(audio))
+    try:
+        out_file = io.BytesIO()
+        process = (
+            ffmpeg.input(file_path, ss=start_time, t=duration)
+            .output("pipe:1", format="wav")
+            .run_async(pipe_stdout=True, pipe_stderr=True)
+        )
+        output, err = process.communicate()
         
-        segmento_audio = audio[int(inicio):int(fim)]
-        
-        print(f"\n🎯 Processando segmento {i+1}/{num_segmentos} ({inicio/whisper.audio.SAMPLE_RATE/60:.1f}-{fim/whisper.audio.SAMPLE_RATE/60:.1f} min)")
-        
-        # Configurações anti-repetição MAIS AGRESSIVAS
-        result = model.transcribe(
-            segmento_audio,
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg error: {err.decode() if err else 'Unknown error'}")
+
+        out_file.write(output)
+        out_file.seek(0)
+        out_file.name = "chunk.wav" # Necessário para a API da Groq
+        return out_file
+    except Exception as e:
+        print(f"Erro ao extrair chunk de {start_time}s: {str(e)}")
+        raise
+
+def transcribe_chunk(client, audio_file_obj):
+    """Envia o chunk para a API da Groq e retorna o texto."""
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=audio_file_obj,
+            model="whisper-large-v3-turbo",
+            response_format="json",
             language="pt",
-            verbose=False,
-            fp16=gpu_disponivel,
-            temperature=0.0,  # Mais determinístico
-            beam_size=1,
-            best_of=1,
-            word_timestamps=False,
-            no_speech_threshold=0.8,  # Mais restritivo para silêncios
-            logprob_threshold=-0.5,   # Mais restritivo para confiança
-            compression_ratio_threshold=2.0,  # Mais sensível a repetições
-            condition_on_previous_text=False,
-            hallucination_silence_threshold=2.0,  # Mais sensível a alucinações
-            suppress_tokens=[-1],  # Suprime tokens problemáticos
-            initial_prompt="Esta é uma transcrição de uma reunião de trabalho em português brasileiro."
+            temperature=0.0
         )
-        
-        texto_segmento = result["text"].strip()
-        
-        # FILTRO ADICIONAL: Remove repetições óbvias dentro do segmento
-        texto_segmento = remover_repeticoes_locais(texto_segmento)
-        
-        # Adiciona uma quebra entre segmentos
-        if i > 0 and texto_segmento:
-            texto_completo += "\n\n"
-        
-        if texto_segmento:  # Só adiciona se não estiver vazio
-            texto_completo += texto_segmento
-        
-        print(f"✅ Segmento {i+1} concluído: {len(texto_segmento)} caracteres")
-        
-        # Limpa cache da GPU entre segmentos
-        if gpu_disponivel:
-            torch.cuda.empty_cache()
-    
-    # FILTRO FINAL: Remove repetições entre segmentos
-    texto_completo = remover_repeticoes_globais(texto_completo)
-    
-    return texto_completo
+        return transcription.text
+    except Exception as e:
+        print(f"Erro na API da Groq: {str(e)}")
+        return "[ERRO NA TRANSCRIÇÃO DESTE TRECHO]"
 
-def remover_repeticoes_locais(texto):
-    """
-    Remove repetições óbvias dentro de um segmento de texto.
-    """
-    import re
-    
-    # Remove repetições de palavras consecutivas (mais de 3x)
-    palavras = texto.split()
-    resultado = []
-    contador = 1
-    palavra_anterior = ""
-    
-    for palavra in palavras:
-        if palavra.lower() == palavra_anterior.lower():
-            contador += 1
-            if contador <= 3:  # Permite até 3 repetições
-                resultado.append(palavra)
-        else:
-            resultado.append(palavra)
-            contador = 1
-            palavra_anterior = palavra
-    
-    return " ".join(resultado)
+def save_text(text, file_path):
+    """Salva texto no arquivo de saída (append)."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(text + "\n\n")
 
-def remover_repeticoes_globais(texto):
-    """
-    Remove repetições de frases/blocos maiores no texto completo.
-    """
-    import re
+def process_file(file_path, client):
+    """Processa um único arquivo de áudio."""
+    print(f"\n🎧 Processando arquivo: {file_path}")
+    duration = get_audio_duration(file_path)
+    print(f"⏱️ Duração total: {duration:.2f} segundos ({duration/60:.2f} min)")
     
-    linhas = texto.split('\n')
-    linhas_limpas = []
+    # Adiciona cabeçalho ao markdown
+    save_text(f"\n## Transcrição: {os.path.basename(file_path)}\n", OUTPUT_FILE)
     
-    for linha in linhas:
-        linha = linha.strip()
-        if not linha:
-            continue
-            
-        # Remove linhas que são muito similares às anteriores
-        if not eh_linha_repetitiva(linha, linhas_limpas):
-            linhas_limpas.append(linha)
+    current_time = 0
+    chunk_count = 1
     
-    return '\n'.join(linhas_limpas)
-
-def eh_linha_repetitiva(linha_atual, linhas_anteriores, threshold=0.8):
-    """
-    Verifica se uma linha é muito similar às anteriores.
-    """
-    if len(linhas_anteriores) == 0:
-        return False
-    
-    # Verifica similaridade com as últimas 5 linhas
-    for linha_anterior in linhas_anteriores[-5:]:
-        similaridade = calcular_similaridade(linha_atual.lower(), linha_anterior.lower())
-        if similaridade > threshold:
-            return True
-    
-    return False
-
-def calcular_similaridade(str1, str2):
-    """
-    Calcula similaridade simples entre duas strings.
-    """
-    if not str1 or not str2:
-        return 0
-    
-    palavras1 = set(str1.split())
-    palavras2 = set(str2.split())
-    
-    if not palavras1 or not palavras2:
-        return 0
-    
-    intersecao = len(palavras1.intersection(palavras2))
-    uniao = len(palavras1.union(palavras2))
-    
-    return intersecao / uniao if uniao > 0 else 0
-
-def transcrever_audio_longo(caminho_audio, modelo="base", usar_gpu=True, usar_segmentacao=True):
-    """
-    Função principal de transcrição com opção de segmentação automática.
-    usar_segmentacao: Se True, divide áudios longos em segmentos (recomendado)
-    """
-    if usar_segmentacao:
-        # Usa a nova função segmentada para evitar repetições
-        texto = transcrever_audio_segmentado(caminho_audio, modelo, usar_gpu)
-    else:
-        # Função original (pode ter problemas com áudios longos)
-        gpu_disponivel = verificar_gpu() and usar_gpu
-        device = "cuda" if gpu_disponivel else "cpu"
+    while current_time < duration:
+        print(f"  🔄 Processando parte {chunk_count}: {current_time/60:.2f}m - {(current_time + CHUNK_DURATION)/60:.2f}m")
         
-        print(f"Carregando modelo Whisper '{modelo}' no {device.upper()}...")
+        # Extrai chunk
+        audio_chunk = extract_audio_chunk(file_path, current_time, CHUNK_DURATION)
         
-        if gpu_disponivel:
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
+        # Transcreve
+        text = transcribe_chunk(client, audio_chunk)
+        print(f"    ✅ Transcrição recebida ({len(text)} chars)")
         
-        model = whisper.load_model(modelo, device=device)
+        # Salva
+        save_text(text, OUTPUT_FILE)
+        print(f"    💾 Salvo em {OUTPUT_FILE}")
         
-        print(f"Iniciando transcrição de: {caminho_audio}")
-        if gpu_disponivel:
-            print("🚀 Usando GPU - velocidade ~10x mais rápida!")
-            print("⚠️  Avisos sobre Triton são normais e não afetam o desempenho")
-        else:
-            print("⚠️  Para áudios de 2h+, isso pode demorar 30-60 minutos...")
+        current_time += CHUNK_DURATION
+        chunk_count += 1
         
-        # Configurações para evitar repetições em áudios longos
-        result = model.transcribe(
-            caminho_audio,
-            language="pt",              
-            verbose=True,
-            fp16=gpu_disponivel,        
-            temperature=0.2,            # Aumenta diversidade, evita repetições
-            beam_size=1,                # Reduz para evitar loops
-            best_of=1,                  # Reduz para evitar loops
-            word_timestamps=False,
-            no_speech_threshold=0.6,    # Detecta melhor silêncios
-            logprob_threshold=-1.0,     # Filtra tokens com baixa confiança
-            compression_ratio_threshold=2.4,  # Detecta repetições
-            condition_on_previous_text=False,  # Evita dependência de texto anterior
-            hallucination_silence_threshold=3.0  # Detecta alucinações em silêncios
-        )
-        
-        if gpu_disponivel:
-            torch.cuda.empty_cache()
-        
-        texto = result["text"]
-    
-    # Salva o resultado
-    output_dir = Path("./texto")
-    output_dir.mkdir(exist_ok=True)
-    
-    output_path = output_dir / "texto_gerado.md"
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("# Transcrição do Áudio\n\n")
-        f.write(texto)
-    
-    print(f"\n✅ Transcrição salva em: {output_path}")
-    print(f"📊 Texto gerado: {len(texto)} caracteres")
-    
-    return texto
+        # Pequena pausa para não abusar do rate limit
+        time.sleep(1)
 
 def main():
-    print("=== TRANSCRIÇÃO DE ÁUDIO COM WHISPER ===\n")
+    if not GROQ_API_KEY:
+        print("❌ Erro: GROQ_API_KEY não encontrada no arquivo .env")
+        return
+
+    client = Groq(api_key=GROQ_API_KEY)
     
-    gpu_disponivel = verificar_gpu()
+    # Cria diretório de audios se não existir
+    if not os.path.exists(AUDIO_FOLDER):
+        os.makedirs(AUDIO_FOLDER)
+        print(f"📁 Pasta '{AUDIO_FOLDER}' criada. Coloque seus arquivos nela.")
+        return
+
+    # Lista arquivos de áudio
+    audio_extensions = ('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.opus')
+    files = [f for f in os.listdir(AUDIO_FOLDER) if f.lower().endswith(audio_extensions)]
     
-    while True:
-        caminho_audio = input("Caminho do arquivo de áudio: ").strip().strip('"')
-        if os.path.exists(caminho_audio):
-            break
-        print("❌ Arquivo não encontrado. Tente novamente.")
+    if not files:
+        print(f"⚠️  Nenhum arquivo de áudio encontrado em '{AUDIO_FOLDER}'")
+        return
+
+    print(f"🚀 Iniciando transcrição de {len(files)} arquivos...")
     
-    print("\nEscolha o modelo:")
-    if gpu_disponivel:
-        print("🚀 GPU DETECTADA - Tempos para áudio de 2h:")
-        print("1. tiny   - ~2 minutos")
-        print("2. base   - ~6 minutos (recomendado)")
-        print("3. small  - ~12 minutos")
-        print("4. medium - ~20 minutos")
-        print("5. large  - ~40 minutos (máxima qualidade)")
-        print("\n⚠️  Para sua GTX 1650 (4GB), recomendo 'base' ou 'small'")
-    else:
-        print("🐌 CPU - Tempos para áudio de 2h:")
-        print("1. tiny   - ~20 minutos")
-        print("2. base   - ~60 minutos")
-        print("3. small  - ~120 minutos")
-        print("4. medium - ~240 minutos")
-        print("5. large  - ~480 minutos")
+    # Limpa ou cria arquivo de saída (opcional: aqui estou dando append, 
+    # mas se for rodar do zero talvez o usuário queira limpar. 
+    # O user disse 'será salvo incrementalmente', não disse limpar.
+    # Vou manter append, mas colocar um separador de início de execução.)
+    save_text(f"\n\n---\n# Nova Execução: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", OUTPUT_FILE)
+
+    for file_name in files:
+        process_file(os.path.join(AUDIO_FOLDER, file_name), client)
     
-    escolha = input("Escolha (1-5, padrão=2): ").strip() or "2"
-    modelos = {"1": "tiny", "2": "base", "3": "small", "4": "medium", "5": "large"}
-    modelo = modelos.get(escolha, "base")
-    
-    if modelo == "large" and gpu_disponivel:
-        print("⚠️  ATENÇÃO: Modelo 'large' pode ser lento na GTX 1650")
-        continuar = input("Continuar mesmo assim? (s/N): ").strip().lower()
-        if continuar != 's':
-            modelo = "base"
-            print("✅ Usando modelo 'base' (mais adequado para sua GPU)")
-    
-    # Nova opção para escolher método de transcrição
-    print("\n🎯 Método de transcrição:")
-    print("1. Segmentado (recomendado para áudios >30min) - Evita repetições")
-    print("2. Completo (mais rápido, mas pode repetir em áudios longos)")
-    
-    metodo = input("Escolha (1-2, padrão=1): ").strip() or "1"
-    usar_segmentacao = metodo == "1"
-    
-    if usar_segmentacao:
-        print("✅ Usando método segmentado - divide o áudio para evitar repetições")
-    else:
-        print("⚠️  Método completo - pode repetir frases em áudios muito longos")
-    
-    try:
-        transcrever_audio_longo(caminho_audio, modelo, gpu_disponivel, usar_segmentacao)
-        print("\n🎉 Transcrição concluída! Execute summary_text.py para gerar o resumo.")
-    except Exception as e:
-        print(f"❌ Erro na transcrição: {e}")
-        if "out of memory" in str(e).lower():
-            print("💡 Tente um modelo menor ou feche outros programas que usam GPU")
+    print("\n🎉 Processamento concluído!")
 
 if __name__ == "__main__":
     main()
