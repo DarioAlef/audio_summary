@@ -10,9 +10,10 @@ __pycache__/
 *.sqlite3
 instance/
 .env
-.env.*
 .DS_Store
 
 
 texto/texto_gerado.md
 audios/*
+textos_gerados/*
+queue/*

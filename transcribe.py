@@ -67,7 +67,7 @@ def save_text(text, file_path):
     """Salva texto no arquivo de saída (append)."""
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     with open(file_path, "a", encoding="utf-8") as f:
-        f.write(text + "\n\n")
+        f.write(text + "\n")
 
 def process_file(file_path, client):
     """Processa um único arquivo de áudio."""
@@ -76,7 +76,7 @@ def process_file(file_path, client):
     print(f"⏱️ Duração total: {duration:.2f} segundos ({duration/60:.2f} min)")
     
     # Adiciona cabeçalho ao markdown
-    save_text(f"\n## Transcrição: {os.path.basename(file_path)}\n", OUTPUT_FILE)
+    save_text(f"\n# Transcrição: {os.path.basename(file_path)}\n", OUTPUT_FILE)
     
     current_time = 0
     chunk_count = 1
@@ -128,7 +128,7 @@ def main():
     # mas se for rodar do zero talvez o usuário queira limpar. 
     # O user disse 'será salvo incrementalmente', não disse limpar.
     # Vou manter append, mas colocar um separador de início de execução.)
-    save_text(f"\n\n---\n# Nova Execução: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", OUTPUT_FILE)
+    #save_text(f"\n\n---\n# Nova Execução: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", OUTPUT_FILE)
 
     for file_name in files:
         process_file(os.path.join(AUDIO_FOLDER, file_name), client)
